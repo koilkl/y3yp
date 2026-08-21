@@ -1,0 +1,3 @@
+[submodule "Incliometer"]
+	path = Incliometer
+	url = ./Incliometer/
