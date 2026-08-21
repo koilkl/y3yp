@@ -1,3 +1,6 @@
-[submodule "Incliometer"]
-	path = Incliometer
-	url = ./Incliometer/
+[submodule "ELEC/Component/Incliometer"]
+	path = ELEC/Component/Incliometer
+	url = https://github.com/koilkl/Incliometer.git
+[submodule "ELEC/Version-1.0/Year_3_first_prototype"]
+	path = ELEC/Version-1.0/Year_3_first_prototype
+	url = https://github.com/yuu033/Year_3_first_prototype
