@@ -71,10 +71,26 @@ By engineering a device that challenges the ankle with resisted eversion and per
 
 ---
 
-## 📂 Repository Structure
+## 💾 Cloning This Repository
 
-> The firmware projects under `ELEC/` are **git submodules** — clone with
-> `git clone --recursive https://github.com/koilkl/y3yp.git` to fetch them.
+The repo uses **git submodules** (firmware) and **Git LFS** (large media files):
+
+```bash
+# 1. Install Git LFS (once per machine)
+#    macOS:      brew install git-lfs
+#    Windows:    winget install Git.LFS
+#    Ubuntu:     sudo apt install git-lfs
+git lfs install
+
+# 2. Clone with submodules
+git clone --recursive https://github.com/koilkl/y3yp.git
+```
+
+* `git lfs install` sets up the LFS filters on your machine. Without it, LFS-tracked files (e.g. `*.mp4`) are checked out as small pointer files instead of the real content.
+* Already cloned without LFS support? Run `git lfs install && git lfs pull` to download the tracked files.
+* `--recursive` fetches the firmware submodules under `ELEC/`; alternatively run `git submodule update --init --recursive` inside an existing clone.
+
+## 📂 Repository Structure
 
 ```
 y3yp/

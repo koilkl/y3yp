@@ -8,7 +8,7 @@ First-generation deliverables of the **Actuation Belt Trainer**.
 |------|-------------|
 | [`Midterm Presentation.pptx`](Midterm%20Presentation.pptx) | Midterm progress presentation (PowerPoint) |
 | [`Final Presentation.pdf`](Final%20Presentation.pdf) | Final presentation slides (PDF) |
-| [`demo video.mp4`](demo%20video.mp4) | Prototype demonstration video |
+| [`demo video.mp4`](demo%20video.mp4) | Prototype demonstration video (stored via Git LFS — see [clone instructions](../../readme.md#-cloning-this-repository)) |
 
 ## Related
 
