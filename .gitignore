@@ -1,1 +1,12 @@
+# macOS
 .DS_Store
+
+# CMake build output
+build/
+cmake-build-*/
+
+# STM32CubeMX local metadata
+*.mxproject
+.settings/
+.vscode/
+.clangd/
