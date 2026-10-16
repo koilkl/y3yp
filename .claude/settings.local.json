@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(unzip -l /Users/koil/Documents/y3yp/MECH/Version-1.0/Gen1-belt.zip)",
+      "Bash(git add *)",
+      "Bash(git pull *)",
+      "Bash(git rm *)",
+      "Bash(git submodule *)",
+      "Bash(git -C /Users/koil/Documents/y3yp status --short)",
+      "Bash(git -C /Users/koil/Documents/y3yp rm --cached -r -q ELEC/Component/Incliometer ELEC/Version-1.0/Year_3_first_prototype)",
+      "Bash(git -C /Users/koil/Documents/y3yp submodule add https://github.com/koilkl/Incliometer.git ELEC/Component/Incliometer)",
+      "Bash(git -C /Users/koil/Documents/y3yp submodule add https://github.com/yuu033/Year_3_first_prototype ELEC/Version-1.0/Year_3_first_prototype)",
+      "Bash(git -C /Users/koil/Documents/y3yp rm --cached -r -f -q ELEC/Component/Incliometer ELEC/Version-1.0/Year_3_first_prototype)",
+      "Bash(git -C /Users/koil/Documents/y3yp add -A)",
+      "Bash(git -C /Users/koil/Documents/y3yp submodule status)",
+      "Bash(git -C /Users/koil/Documents/y3yp branch --show-current)",
+      "Bash(git *)"
+    ]
+  }
+}
