@@ -1,246 +1,332 @@
+/**
+ ******************************************************************************
+ * @file    interface_button.c
+ * @brief   含开机灯条自检 + 0kg蓝光待机指示 + 500us强锁存 + D12(PA6)/D10(PB6)双输出
+ ******************************************************************************
+ */
+
 #include "interface_button.h"
 
-/* 内部辅助函数：根据传入的 GPIO_TypeDef 自动使能对应的 RCC 时钟 */
-static void AnkleUI_EnablePortClock(GPIO_TypeDef *port) {
-    if (port == GPIOA)      { __HAL_RCC_GPIOA_CLK_ENABLE(); }
-    else if (port == GPIOB) { __HAL_RCC_GPIOB_CLK_ENABLE(); }
-    else if (port == GPIOC) { __HAL_RCC_GPIOC_CLK_ENABLE(); }
-    else if (port == GPIOD) { __HAL_RCC_GPIOD_CLK_ENABLE(); }
-    else if (port == GPIOE) { __HAL_RCC_GPIOE_CLK_ENABLE(); }
-    else if (port == GPIOH) { __HAL_RCC_GPIOH_CLK_ENABLE(); }
+typedef struct {
+    AnkleBtnPin_t pin_cfg;
+    GPIO_PinState current_reading;
+    GPIO_PinState stable_state;
+    uint32_t      last_debounce_ms;
+    uint32_t      press_start_ms;
+    uint32_t      last_repeat_ms;
+    bool          is_active;
+    bool          armed;
+} InputInternal_t;
+
+static InputInternal_t inputs[INPUT_COUNT];
+
+static bool     status_led_active   = false;
+static uint32_t status_led_start_ms = 0;
+
+static ToggleSwitchState_t last_sw_state = SW_STATE_CENTER_OFF;
+static bool                first_sw_sync = true;
+
+#define DEBOUNCE_DELAY_MS     20
+#define AUTO_REPEAT_DELAY_MS  500
+#define AUTO_REPEAT_RATE_MS   150
+
+// 备用灯条信号脚：PB6 (正面母座 D10)，与 PA6 (正面母座 D12) 同步输出！
+#define WS_BACKUP_PORT        GPIOB
+#define WS_BACKUP_PIN         GPIO_PIN_6
+
+static uint8_t rgb_data[NUM_LEDS][3];
+
+// 6 颗灯珠渐变色谱：[G, R, B]
+static const uint8_t COLOR_MAP[NUM_LEDS][3] = {
+    {150, 0,   0},   // 第 1 颗：纯绿色 (0.5 ~ 1.5 kg)
+    {130, 40,  0},   // 第 2 颗：草绿色 (2.0 ~ 3.0 kg)
+    {110, 100, 0},   // 第 3 颗：亮黄色 (3.5 ~ 5.0 kg)
+    {60,  150, 0},   // 第 4 颗：亮橙色 (5.5 ~ 6.5 kg)
+    {20,  150, 0},   // 第 5 颗：深橙红 (7.0 ~ 8.5 kg)
+    {0,   150, 0}    // 第 6 颗：纯红色 (9.0 ~ 10.0 kg)
+};
+
+static void Enable_GPIO_Clock(GPIO_TypeDef* port) {
+    if (port == GPIOA)      __HAL_RCC_GPIOA_CLK_ENABLE();
+    else if (port == GPIOB) __HAL_RCC_GPIOB_CLK_ENABLE();
+    else if (port == GPIOC) __HAL_RCC_GPIOC_CLK_ENABLE();
+    else if (port == GPIOD) __HAL_RCC_GPIOD_CLK_ENABLE();
 }
 
-/* 内部辅助函数：数值上下限限幅 */
-static int16_t Clamp_i16(int16_t val, int16_t min_val, int16_t max_val) {
-    if (val < min_val) return min_val;
-    if (val > max_val) return max_val;
-    return val;
-}
+/* ==================== 强制 O2 + DWT 硬件时序 + 500us 强锁存复位 ==================== */
+__attribute__((optimize("O2"))) static void WS2812_Show(void) {
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
-/* 内部辅助函数：处理单个按钮的触发动作 (含防呆与卸力保护逻辑) */
-static void AnkleUI_ExecuteAction(AnkleController_t *ctrl, AnkleBtnIndex_t btn_idx, bool is_repeat) {
-    /* 【防呆 1：运行施力期间禁止长按连发暴冲】
-     * 当处于 STARTED (踏板已加载力矩) 状态时，禁止任何按键的长按连发，
-     * 仅允许单次点按微调，防止踏板力矩或目标角度瞬间暴增伤及脚踝 */
-    if (ctrl->is_running && is_repeat) {
-        return;
+    const uint32_t clk_mhz    = SystemCoreClock / 1000000UL;
+    const uint32_t t0h_cycles = (clk_mhz * 350) / 1000;   // 0码高电平 ~350ns
+    const uint32_t t1h_cycles = (clk_mhz * 800) / 1000;   // 1码高电平 ~800ns
+    const uint32_t tot_cycles = (clk_mhz * 1250) / 1000;  // 单bit总周期 ~1250ns
+    const uint32_t rst_cycles = clk_mhz * 500;            // 500us 强锁存低电平复位
+
+    __disable_irq();
+
+    for (int i = 0; i < NUM_LEDS; i++) {
+        for (int c = 0; c < 3; c++) {
+            uint8_t byte = rgb_data[i][c];
+            for (int b = 7; b >= 0; b--) {
+                uint32_t start_cycle = DWT->CYCCNT;
+
+                // 同时拉高 PA6 (D12) 和 PB6 (D10)
+                WS_PORT->BSRR        = WS_PIN;
+                WS_BACKUP_PORT->BSRR = WS_BACKUP_PIN;
+
+                uint32_t high_wait = ((byte >> b) & 0x01) ? t1h_cycles : t0h_cycles;
+                while ((DWT->CYCCNT - start_cycle) < high_wait) {}
+
+                // 同时拉低 PA6 (D12) 和 PB6 (D10)
+                WS_PORT->BSRR        = ((uint32_t)WS_PIN << 16);
+                WS_BACKUP_PORT->BSRR = ((uint32_t)WS_BACKUP_PIN << 16);
+
+                while ((DWT->CYCCNT - start_cycle) < tot_cycles) {}
+            }
+        }
     }
 
-    switch (btn_idx) {
-        case BTN_START_RESET:
-            // 同一个按钮切换 Start (加载力矩) / Reset (卸除力矩)，不支持长按连发
-            if (!is_repeat) {
-                if (!ctrl->is_running) {
-                    // 安全启动检查：如果按下 Start 瞬间还有其他调节键被按住，拒绝启动（防误触）
-                    for (uint8_t i = 0; i < BTN_START_RESET; i++) {
-                        if (ctrl->filters[i].stable_state) {
-                            return;
-                        }
-                    }
-                    ctrl->is_running = true; // 启动训练，开始按设定模式施力
-                } else {
-                    // 【最高优先级 Reset：立即卸除踏板上的所有力】
-                    // 无论在 Mode 1 还是 Mode 2 下，按下 Reset 立即停止输出并将力量清零 (0 kg)
-                    ctrl->is_running = false;
-                    ctrl->strength   = 0;
-                    ctrl->angle      = 0;
-                }
-            }
-            break;
+    // 关键修复：保持 >500us 纯低电平，确保新版 WS2812B 100% 锁存亮起！
+    uint32_t rst_start = DWT->CYCCNT;
+    WS_PORT->BSRR        = ((uint32_t)WS_PIN << 16);
+    WS_BACKUP_PORT->BSRR = ((uint32_t)WS_BACKUP_PIN << 16);
+    while ((DWT->CYCCNT - rst_start) < rst_cycles) {}
 
-        case BTN_MODE_TOGGLE:
-            // Mode 切换：不支持长按连发，且运行施力期间严禁切换模式
-            if (!is_repeat && !ctrl->is_running) {
-                if (ctrl->mode == TRAINING_MODE_1) {
-                    // 切入 Mode 2 (用户主动发力踩动踏板)：
-                    // 踏板角度随用户自由运动，无需按钮预设角度，因此将预设值清零
-                    ctrl->mode  = TRAINING_MODE_2;
-                    ctrl->angle = 0;
-                } else {
-                    // 切回 Mode 1 (用户抵抗踏板主动施加的力)
-                    ctrl->mode  = TRAINING_MODE_1;
-                }
-            }
-            break;
-
-        case BTN_AXIS_TOGGLE:
-            // Axis 切换：不支持长按连发，且运行施力期间严禁切换运动轴
-            if (!is_repeat && !ctrl->is_running) {
-                ctrl->axis = (ctrl->axis == AXIS_ROLL) ? AXIS_PITCH : AXIS_ROLL;
-            }
-            break;
-
-        case BTN_ANGLE_INC:
-            // 【防呆 2：正反键互斥】若 Angle - 同时被按住，直接忽略
-            if (ctrl->filters[BTN_ANGLE_DEC].stable_state) {
-                return;
-            }
-            // 仅在 Mode 1 (用户抵抗踏板施力) 下需要通过按钮设定目标角度；
-            // 在 Mode 2 下由用户主动踩动踏板，按钮控制被旁路 (Bypassed)
-            if (ctrl->mode == TRAINING_MODE_1) {
-                ctrl->angle = Clamp_i16(ctrl->angle + ctrl->angle_step, ANKLE_ANGLE_MIN, ANKLE_ANGLE_MAX);
-            }
-            break;
-
-        case BTN_ANGLE_DEC:
-            // 【防呆 2：正反键互斥】若 Angle + 同时被按住，直接忽略
-            if (ctrl->filters[BTN_ANGLE_INC].stable_state) {
-                return;
-            }
-            // 仅在 Mode 1 下通过按钮设定目标角度；Mode 2 下忽略角度按钮
-            if (ctrl->mode == TRAINING_MODE_1) {
-                ctrl->angle = Clamp_i16(ctrl->angle - ctrl->angle_step, ANKLE_ANGLE_MIN, ANKLE_ANGLE_MAX);
-            }
-            break;
-
-        case BTN_STRENGTH_INC:
-            // 【防呆 2：正反键互斥】若 Strength - 同时被按住，直接忽略
-            if (ctrl->filters[BTN_STRENGTH_DEC].stable_state) {
-                return;
-            }
-            // Mode 1 (踏板主动施力大小) 与 Mode 2 (踏板阻力大小) 均支持调节 Strength
-            ctrl->strength = Clamp_i16(ctrl->strength + ctrl->strength_step, ANKLE_STRENGTH_MIN, ANKLE_STRENGTH_MAX);
-            break;
-
-        case BTN_STRENGTH_DEC:
-            // 【防呆 2：正反键互斥】若 Strength + 同时被按住，直接忽略
-            if (ctrl->filters[BTN_STRENGTH_INC].stable_state) {
-                return;
-            }
-            ctrl->strength = Clamp_i16(ctrl->strength - ctrl->strength_step, ANKLE_STRENGTH_MIN, ANKLE_STRENGTH_MAX);
-            break;
-
-        default:
-            break;
-    }
+    __enable_irq();
 }
 
-void AnkleUI_Init(AnkleController_t *ctrl,
-                  const AnkleBtnPin_t pin_array[BTN_COUNT],
-                  int16_t angle_step,
-                  int16_t strength_step) {
-    if (ctrl == NULL || pin_array == NULL) return;
+static void WS2812_SetLED(uint8_t index, uint8_t g, uint8_t r, uint8_t b) {
+    if (index >= NUM_LEDS) return;
+    rgb_data[index][0] = g;
+    rgb_data[index][1] = r;
+    rgb_data[index][2] = b;
+}
 
+static uint8_t WS2812_UpdateStrip(uint8_t raw_value) {
+    uint8_t num_lit = 0;
+    if (raw_value > 0) {
+        num_lit = (uint8_t)(((uint16_t)raw_value * NUM_LEDS + 10) / 20);
+        if (num_lit > NUM_LEDS) num_lit = NUM_LEDS;
+    }
+
+    for (uint8_t i = 0; i < NUM_LEDS; i++) {
+        if (i < num_lit) {
+            WS2812_SetLED(i, COLOR_MAP[i][0], COLOR_MAP[i][1], COLOR_MAP[i][2]);
+        } else {
+            WS2812_SetLED(i, 0, 0, 0);
+        }
+    }
+
+    // 当力为 0.0 kg 时，让第 1 颗灯珠亮微弱的待机冰蓝色 (B=40)，一眼确认灯条工作正常！
+    if (raw_value == 0) {
+        WS2812_SetLED(0, 0, 0, 40);
+    }
+
+    WS2812_Show();
+    return num_lit;
+}
+
+static bool Step_ForceValue(AnkleCtrl_t* ctrl, int8_t dir) {
+    if (dir > 0) {
+        if (ctrl->raw_value < ctrl->max_raw) {
+            ctrl->raw_value++;
+            return true;
+        }
+    } else if (dir < 0) {
+        if (ctrl->raw_value > ctrl->min_raw) {
+            ctrl->raw_value--;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void Trigger_StatusLED(uint32_t now) {
+    HAL_GPIO_WritePin(LED_STATUS_PORT, LED_STATUS_PIN, GPIO_PIN_SET);
+    status_led_active   = true;
+    status_led_start_ms = now;
+}
+
+void AnkleUI_Init(const AnkleBtnPin_t* pin_config) {
     uint32_t now = HAL_GetTick();
     GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-    for (uint8_t i = 0; i < BTN_COUNT; i++) {
-        ctrl->pins[i] = pin_array[i];
+    // 1. 初始化 4 路输入引脚 (PULLUP)
+    for (int i = 0; i < INPUT_COUNT; i++) {
+        inputs[i].pin_cfg = pin_config[i];
+        Enable_GPIO_Clock(inputs[i].pin_cfg.port);
 
-        // 1. 自动开启对应 GPIO 端口时钟
-        AnkleUI_EnablePortClock(ctrl->pins[i].port);
+        GPIO_InitStruct.Pin   = inputs[i].pin_cfg.pin;
+        GPIO_InitStruct.Mode  = GPIO_MODE_INPUT;
+        GPIO_InitStruct.Pull  = GPIO_PULLUP;
+        GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+        HAL_GPIO_Init(inputs[i].pin_cfg.port, &GPIO_InitStruct);
 
-        // 2. 配置为内部上拉输入模式 (按钮另一端接 GND，按下为低电平)
-        GPIO_InitStruct.Pin  = ctrl->pins[i].pin;
-        GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-        GPIO_InitStruct.Pull = GPIO_PULLUP;
-        HAL_GPIO_Init(ctrl->pins[i].port, &GPIO_InitStruct);
+        GPIO_PinState init_pin = HAL_GPIO_ReadPin(inputs[i].pin_cfg.port, inputs[i].pin_cfg.pin);
+        inputs[i].current_reading  = init_pin;
+        inputs[i].stable_state     = init_pin;
+        inputs[i].last_debounce_ms = now;
+        inputs[i].press_start_ms   = 0;
+        inputs[i].last_repeat_ms   = 0;
 
-        // 3. 【防呆 3：上电防短路/卡死自检 (armed 锁)】
-        // 若上电瞬间引脚已处于低电平，挂上 armed = false 保险锁，直到松开满 20ms 后才解锁
-        bool initial_pressed = (HAL_GPIO_ReadPin(ctrl->pins[i].port, ctrl->pins[i].pin) == GPIO_PIN_RESET);
-        ctrl->filters[i].raw_state        = initial_pressed;
-        ctrl->filters[i].stable_state     = initial_pressed;
-        ctrl->filters[i].armed            = !initial_pressed;
-        ctrl->filters[i].last_change_tick = now;
-        ctrl->filters[i].last_repeat_tick = now;
+        if (i == BTN_UP || i == BTN_DOWN) {
+            inputs[i].is_active = false;
+            inputs[i].armed     = (init_pin == GPIO_PIN_SET);
+        } else {
+            inputs[i].is_active = (init_pin == GPIO_PIN_RESET);
+            inputs[i].armed     = true;
+        }
     }
 
-    // 4. 初始化业务状态与步长 (初始处于完全卸力待机状态)
-    ctrl->axis          = AXIS_ROLL;
-    ctrl->mode          = TRAINING_MODE_1;
-    ctrl->angle         = 0;
-    ctrl->strength      = 0;
-    ctrl->is_running    = false;
-    ctrl->angle_step    = (angle_step > 0) ? angle_step : 1;
-    ctrl->strength_step = (strength_step > 0) ? strength_step : 1;
-    ctrl->state_changed = true;
+    // 2. 初始化常亮电源灯 PA5 (LD2) 與 变力状态灯 PA7 (D11)
+    Enable_GPIO_Clock(LED_POWER_PORT);
+    GPIO_InitStruct.Pin   = LED_POWER_PIN;
+    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(LED_POWER_PORT, &GPIO_InitStruct);
+
+    Enable_GPIO_Clock(LED_STATUS_PORT);
+    GPIO_InitStruct.Pin   = LED_STATUS_PIN;
+    HAL_GPIO_Init(LED_STATUS_PORT, &GPIO_InitStruct);
+
+    // 3. 初始化灯条主引脚 PA6 (正面母座 D12) 与 备用引脚 PB6 (正面母座 D10)
+    Enable_GPIO_Clock(WS_PORT);
+    GPIO_InitStruct.Pin   = WS_PIN;
+    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(WS_PORT, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(WS_PORT, WS_PIN, GPIO_PIN_RESET);
+
+    Enable_GPIO_Clock(WS_BACKUP_PORT);
+    GPIO_InitStruct.Pin   = WS_BACKUP_PIN;
+    HAL_GPIO_Init(WS_BACKUP_PORT, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(WS_BACKUP_PORT, WS_BACKUP_PIN, GPIO_PIN_RESET);
+    HAL_Delay(5);
+
+    // 4. 点亮电源灯，并执行开机 6 颗灯珠跑马灯自检 (持续约 0.4 秒)
+    HAL_GPIO_WritePin(LED_POWER_PORT, LED_POWER_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(LED_STATUS_PORT, LED_STATUS_PIN, GPIO_PIN_RESET);
+
+    for (uint8_t step = 2; step <= 20; step += 4) {
+        WS2812_UpdateStrip(step);
+        HAL_Delay(60);
+    }
+    // 自检完毕，回到 0.0 kg 待机状态 (第 1 颗灯常亮微弱冰蓝光)
+    WS2812_UpdateStrip(0);
 }
 
-void AnkleUI_SetSteps(AnkleController_t *ctrl, int16_t angle_step, int16_t strength_step) {
-    if (ctrl == NULL) return;
-    if (angle_step > 0)    ctrl->angle_step    = angle_step;
-    if (strength_step > 0) ctrl->strength_step = strength_step;
-}
-
-bool AnkleUI_Update(AnkleController_t *ctrl) {
-    if (ctrl == NULL) return false;
-
+void AnkleUI_Update(AnkleCtrl_t* ctrl) {
     uint32_t now = HAL_GetTick();
+    bool force_changed = false;
+    bool single_edge_trig[2] = {false, false};
 
-    // 记录本轮扫描前的状态快照，只有数据真正改变才返回 true
-    AnkleAxis_t prev_axis     = ctrl->axis;
-    AnkleMode_t prev_mode     = ctrl->mode;
-    int16_t     prev_angle    = ctrl->angle;
-    int16_t     prev_strength = ctrl->strength;
-    bool        prev_running  = ctrl->is_running;
+    if (ctrl->max_raw == 0) ctrl->max_raw = 20;
+    if (ctrl->raw_value > ctrl->max_raw) ctrl->raw_value = ctrl->max_raw;
 
-    // 第一阶段：全盘采样并更新所有 7 个按键的物理消抖状态
-    bool single_trigger[BTN_COUNT] = {false};
-    bool repeat_trigger[BTN_COUNT] = {false};
+    if (status_led_active && ((now - status_led_start_ms) >= STATUS_LED_ON_MS)) {
+        HAL_GPIO_WritePin(LED_STATUS_PORT, LED_STATUS_PIN, GPIO_PIN_RESET);
+        status_led_active = false;
+    }
 
-    for (uint8_t i = 0; i < BTN_COUNT; i++) {
-        bool current_pressed = (HAL_GPIO_ReadPin(ctrl->pins[i].port, ctrl->pins[i].pin) == GPIO_PIN_RESET);
-        AnkleBtnFilter_t *flt = &ctrl->filters[i];
+    for (int i = 0; i < INPUT_COUNT; i++) {
+        GPIO_PinState raw_pin = HAL_GPIO_ReadPin(inputs[i].pin_cfg.port, inputs[i].pin_cfg.pin);
 
-        if (current_pressed != flt->raw_state) {
-            flt->raw_state = current_pressed;
-            flt->last_change_tick = now;
+        if (raw_pin != inputs[i].current_reading) {
+            inputs[i].last_debounce_ms = now;
+            inputs[i].current_reading  = raw_pin;
         }
 
-        if ((now - flt->last_change_tick) >= BTN_DEBOUNCE_MS) {
-            if (flt->stable_state != flt->raw_state) {
-                flt->stable_state = flt->raw_state;
+        if ((now - inputs[i].last_debounce_ms) >= DEBOUNCE_DELAY_MS) {
+            if (!inputs[i].armed) {
+                if (raw_pin == GPIO_PIN_SET) {
+                    inputs[i].armed        = true;
+                    inputs[i].stable_state = GPIO_PIN_SET;
+                    inputs[i].is_active    = false;
+                }
+                continue;
+            }
 
-                if (flt->stable_state) {
-                    // 刚稳定按下：只有已解锁 (armed == true) 的正常按钮才允许触发
-                    if (flt->armed) {
-                        flt->last_repeat_tick = now;
-                        single_trigger[i] = true;
+            if (raw_pin != inputs[i].stable_state) {
+                inputs[i].stable_state = raw_pin;
+
+                if (inputs[i].stable_state == GPIO_PIN_RESET) {
+                    inputs[i].is_active      = true;
+                    inputs[i].press_start_ms = now;
+                    inputs[i].last_repeat_ms = now;
+                    if (i == BTN_UP || i == BTN_DOWN) {
+                        single_edge_trig[i] = true;
                     }
                 } else {
-                    // 刚稳定松开满 20ms：自动解除上电锁定
-                    flt->armed = true;
+                    inputs[i].is_active      = false;
+                    inputs[i].press_start_ms = 0;
+                    inputs[i].last_repeat_ms = 0;
                 }
-            } else if (flt->stable_state && flt->armed) {
-                // 持续稳定按下且已解锁：检查是否达到 500ms 长按连发条件
-                if ((now - flt->last_change_tick) >= BTN_LONG_PRESS_START_MS) {
-                    if ((now - flt->last_repeat_tick) >= BTN_REPEAT_INTERVAL_MS) {
-                        flt->last_repeat_tick = now;
-                        repeat_trigger[i] = true;
+            }
+        }
+    }
+
+    bool left_on  = inputs[SW_POS_LEFT].is_active;
+    bool right_on = inputs[SW_POS_RIGHT].is_active;
+
+    ToggleSwitchState_t new_sw_state = SW_STATE_CENTER_OFF;
+    if (left_on && right_on) {
+        ctrl->sw_fault = true;
+        new_sw_state   = SW_STATE_CENTER_OFF;
+    } else {
+        ctrl->sw_fault = false;
+        if (left_on) {
+            new_sw_state = SW_STATE_LEFT_ON;
+        } else if (right_on) {
+            new_sw_state = SW_STATE_RIGHT_ON;
+        } else {
+            new_sw_state = SW_STATE_CENTER_OFF;
+        }
+    }
+
+    if (first_sw_sync || (new_sw_state != last_sw_state)) {
+        ctrl->sw_state   = new_sw_state;
+        last_sw_state    = new_sw_state;
+        first_sw_sync    = false;
+        ctrl->ui_updated = true;
+    }
+
+    if (inputs[BTN_UP].is_active && inputs[BTN_DOWN].is_active) {
+        inputs[BTN_UP].press_start_ms   = now;
+        inputs[BTN_UP].last_repeat_ms   = now;
+        inputs[BTN_DOWN].press_start_ms = now;
+        inputs[BTN_DOWN].last_repeat_ms = now;
+        ctrl->btn_conflict              = true;
+        return;
+    }
+    ctrl->btn_conflict = false;
+
+    for (int i = 0; i < 2; i++) {
+        int8_t dir = (i == BTN_UP) ? +1 : -1;
+
+        if (single_edge_trig[i]) {
+            if (Step_ForceValue(ctrl, dir)) {
+                force_changed = true;
+            }
+        } else if (inputs[i].is_active) {
+            if ((now - inputs[i].press_start_ms) >= AUTO_REPEAT_DELAY_MS) {
+                if ((now - inputs[i].last_repeat_ms) >= AUTO_REPEAT_RATE_MS) {
+                    inputs[i].last_repeat_ms = now;
+                    if (Step_ForceValue(ctrl, dir)) {
+                        force_changed = true;
                     }
                 }
             }
         }
     }
 
-    // 第二阶段：【最高优先级：检查 Start / Reset 卸力键】
-    if (single_trigger[BTN_START_RESET]) {
-        AnkleUI_ExecuteAction(ctrl, BTN_START_RESET, false);
-        // 如果刚才这一下触发了 Reset 卸力 (is_running 变成了 false)，直接丢弃本轮其他所有按钮的触发
-        if (!ctrl->is_running) {
-            ctrl->state_changed = (ctrl->axis != prev_axis) || (ctrl->mode != prev_mode) ||
-                                  (ctrl->angle != prev_angle) || (ctrl->strength != prev_strength) ||
-                                  (ctrl->is_running != prev_running);
-            return ctrl->state_changed;
-        }
+    if (force_changed) {
+        Trigger_StatusLED(now);
+        ctrl->display_percentage = (uint8_t)(((uint16_t)ctrl->raw_value * 100) / ctrl->max_raw);
+        ctrl->active_leds        = WS2812_UpdateStrip(ctrl->raw_value);
+        ctrl->ui_updated         = true;
     }
-
-    // 第三阶段：按顺序处理其余 6 个调节按钮 (0 ~ 5)
-    for (uint8_t i = 0; i < BTN_START_RESET; i++) {
-        if (single_trigger[i]) {
-            AnkleUI_ExecuteAction(ctrl, (AnkleBtnIndex_t)i, false);
-        } else if (repeat_trigger[i]) {
-            AnkleUI_ExecuteAction(ctrl, (AnkleBtnIndex_t)i, true);
-        }
-    }
-
-    // 第四阶段：严格比对业务数据是否真正发生了变化
-    ctrl->state_changed = (ctrl->axis       != prev_axis)     ||
-                          (ctrl->mode       != prev_mode)     ||
-                          (ctrl->angle      != prev_angle)    ||
-                          (ctrl->strength   != prev_strength) ||
-                          (ctrl->is_running != prev_running);
-
-    return ctrl->state_changed;
 }

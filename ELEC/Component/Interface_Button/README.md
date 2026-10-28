@@ -116,3 +116,4 @@ To ensure patient safety during motorized ankle rehabilitation, the library enfo
 * `BTN_DEBOUNCE_MS`: Debounce filter window (default: `20U` ms)
 * `BTN_LONG_PRESS_START_MS`: Hold duration required to start auto-repeat (default: `500U` ms)
 * `BTN_REPEAT_INTERVAL_MS`: Interval between auto-repeat increments (default: `100U` ms)
+# Interface_Button
