@@ -2,17 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  * @brief          : 2-Button Force + 3-State Toggle Switch + Status LED + 6-LED Strip
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -30,69 +20,75 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-AnkleController_t ankle_ctrl;
-
-const AnkleBtnPin_t my_button_pins[BTN_COUNT] = {
-    [BTN_MODE_TOGGLE]  = {GPIOC, GPIO_PIN_10}, // CN7 Pin 1: Mode 1 / Mode 2
-    [BTN_AXIS_TOGGLE]  = {GPIOC, GPIO_PIN_11}, // CN7 Pin 2: Roll / Pitch
-    [BTN_ANGLE_INC]    = {GPIOC, GPIO_PIN_12}, // CN7 Pin 3: Angle +
-    [BTN_ANGLE_DEC]    = {GPIOD, GPIO_PIN_2},  // CN7 Pin 4: Angle -
-    [BTN_STRENGTH_INC] = {GPIOC, GPIO_PIN_8},  // CN10 Pin 2: Strength +
-    [BTN_STRENGTH_DEC] = {GPIOC, GPIO_PIN_6},  // CN10 Pin 4: Strength -
-    [BTN_START_RESET]  = {GPIOC, GPIO_PIN_5}   // CN10 Pin 6: Start / Reset
+// 配置 4 路输入引脚：
+// 保持 PC12 (加力) 和 PD2 (减力) 不变；新增 PC10 (拨动开关左档) 和 PC11 (拨动开关右档)
+const AnkleBtnPin_t my_pins[INPUT_COUNT] = {
+    [BTN_UP]       = PC12,
+    [BTN_DOWN]     = PD2,
+    [SW_POS_LEFT]  = PC10,
+    [SW_POS_RIGHT] = PC11
 };
+
+AnkleCtrl_t ankle_ctrl = {
+    .raw_value          = 0,
+    .min_raw            = 0,
+    .max_raw            = 20,
+    .display_percentage = 0,
+    .active_leds        = 0,
+    .sw_state           = SW_STATE_CENTER_OFF,
+    .btn_conflict       = false,
+    .sw_fault           = false,
+    .ui_updated         = false
+};
+
+static bool last_conflict_printed = false;
+static bool last_fault_printed    = false;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
+static void UART_PrintStatus(const AnkleCtrl_t* ctrl);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
-void AnkleUI_PrintStatus_UART(UART_HandleTypeDef *huart, const AnkleController_t *ctrl) {
-    char tx_buf[180];
-
-    const char *state_str = ctrl->is_running ? "STARTED (Force Loaded)" : "RESET (Force Unloaded)";
-    const char *mode_str  = (ctrl->mode == TRAINING_MODE_1) ? "Mode 1 (Resist Pedal)" : "Mode 2 (Active Move) ";
-    const char *axis_str  = (ctrl->axis == AXIS_ROLL) ? "Roll " : "Pitch";
-
-    int len;
-    if (ctrl->mode == TRAINING_MODE_1) {
-        len = snprintf(tx_buf, sizeof(tx_buf),
-                       "[AnkleUI] Status: %-22s | %s | Axis: %s | Angle: %+3d deg     | Strength: %2d kg\r\n",
-                       state_str, mode_str, axis_str, ctrl->angle, ctrl->strength);
-    } else {
-        // Mode 2 下用户主动发力移动踏板，无需按钮控制角度，显示 [FREE_MOVE]
-        len = snprintf(tx_buf, sizeof(tx_buf),
-                       "[AnkleUI] Status: %-22s | %s | Axis: %s | Angle: [FREE_MOVE] | Strength: %2d kg\r\n",
-                       state_str, mode_str, axis_str, ctrl->strength);
+static const char* Get_SwitchStateName(ToggleSwitchState_t state) {
+    switch (state) {
+        case SW_STATE_LEFT_ON:    return "LEFT_ON  (Mode 1)";
+        case SW_STATE_RIGHT_ON:   return "RIGHT_ON (Mode 2)";
+        case SW_STATE_CENTER_OFF:
+        default:                  return "CENTER_OFF (Idle)";
     }
+}
 
+static void UART_PrintStatus(const AnkleCtrl_t* ctrl) {
+    char buf[160];
+    int len = snprintf(buf, sizeof(buf),
+                       "[ANKLE UI] Switch: %-17s | Force: %2d.%d kg | Strip: %3d%% (%d/6 LEDs)\r\n",
+                       Get_SwitchStateName(ctrl->sw_state),
+                       ctrl->raw_value / 2,
+                       (ctrl->raw_value % 2) * 5,
+                       ctrl->display_percentage,
+                       ctrl->active_leds);
     if (len > 0) {
-        HAL_UART_Transmit(huart, (uint8_t *)tx_buf, (uint16_t)len, 100);
+        HAL_UART_Transmit(&huart2, (uint8_t*)buf, (uint16_t)len, 50);
     }
 }
 /* USER CODE END 0 */
-
 
 /**
   * @brief  The application entry point.
@@ -100,58 +96,72 @@ void AnkleUI_PrintStatus_UART(UART_HandleTypeDef *huart, const AnkleController_t
   */
 int main(void)
 {
-
   /* USER CODE BEGIN 1 */
-
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART2_UART_Init();
-  /* USER CODE BEGIN 2 */
-  /* 初始化 7 个按钮引脚与控制器 (角度步长 = 1°, 力量步长 = 1 kg) */
-  AnkleUI_Init(&ankle_ctrl, my_button_pins, 1, 1);
 
-  /* 上电打印欢迎信息与初始状态 */
-  const char *banner = "\r\n========================================================\r\n"
-                       "   Ankle Trainer 7-Button UI Controller Debug Console   \r\n"
-                       "========================================================\r\n";
-  HAL_UART_Transmit(&huart2, (uint8_t *)banner, strlen(banner), 100);
-  AnkleUI_PrintStatus_UART(&huart2, &ankle_ctrl);
+  /* USER CODE BEGIN 2 */
+  AnkleUI_Init(my_pins);
+
+  const char* banner =
+      "\r\n======================================================================\r\n"
+      "  Ankle Trainer Controller (Buttons + 3-Way Switch + Status LED + Strip)\r\n"
+      "  [Force UP/DOWN] : PC12 / PD2 (Active-Low to GND, 0.0~10.0kg, Step 0.5)\r\n"
+      "  [3-Way Switch]  : Left=PC10 | Right=PC11 | Center=OFF (Common to GND)\r\n"
+      "  [LED Outputs]   : Power=PA5(LD2) | ForceStatus=PA7(D11) | Strip=PA6(D12)\r\n"
+      "======================================================================\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t*)banner, (uint16_t)strlen(banner), 100);
+
+  // 开机立即同步一次拨动开关位置并打印
+  AnkleUI_Update(&ankle_ctrl);
+  UART_PrintStatus(&ankle_ctrl);
+  ankle_ctrl.ui_updated = false;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* 非阻塞扫描 7 个按钮：仅在状态发生变化时通过串口打印最新状态 */
-    if (AnkleUI_Update(&ankle_ctrl))
-    {
-      AnkleUI_PrintStatus_UART(&huart2, &ankle_ctrl);
+    AnkleUI_Update(&ankle_ctrl);
+
+    // 防呆报警 1：加减力按钮同时按下
+    if (ankle_ctrl.btn_conflict && !last_conflict_printed) {
+        const char* msg = "[POKA-YOKE] WARNING: UP & DOWN pressed together! Force locked.\r\n";
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, (uint16_t)strlen(msg), 50);
+        last_conflict_printed = true;
+    } else if (!ankle_ctrl.btn_conflict) {
+        last_conflict_printed = false;
     }
+
+    // 防呆报警 2：三态拨动开关左右两脚同时短路
+    if (ankle_ctrl.sw_fault && !last_fault_printed) {
+        const char* msg = "[POKA-YOKE] FAULT: Switch LEFT & RIGHT shorted! Fallback to OFF.\r\n";
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, (uint16_t)strlen(msg), 50);
+        last_fault_printed = true;
+    } else if (!ankle_ctrl.sw_fault) {
+        last_fault_printed = false;
+    }
+
+    // 无论是拨动了三态开关，还是按按钮改变了力，都实时打印最新一行状态
+    if (ankle_ctrl.ui_updated) {
+        UART_PrintStatus(&ankle_ctrl);
+        ankle_ctrl.ui_updated = false;
+    }
+
+    HAL_Delay(1);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }
-
 
 /**
   * @brief System Clock Configuration
@@ -162,14 +172,9 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-  */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -184,8 +189,6 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
@@ -200,36 +203,20 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-
 /* USER CODE END 4 */
 
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
   }
   /* USER CODE END Error_Handler_Debug */
 }
-#ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
+
+#ifdef  USE_FULL_ASSERT
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
