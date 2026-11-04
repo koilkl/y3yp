@@ -5,5 +5,5 @@
 	path = ELEC/Version-1.0/Year_3_first_prototype
 	url = https://github.com/yuu033/Year_3_first_prototype
 [submodule "ELEC/Component/Interface_Buttonhttps:/github.com/koilkl/Interface_Button.git"]
-	path = ELEC/Component/Interface_Buttonhttps:/github.com/koilkl/Interface_Button.git
+	path = ELEC/Component/Interface_Button/
 	url = https://github.com/koilkl/Interface_Button.git
