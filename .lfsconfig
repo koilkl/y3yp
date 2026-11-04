@@ -1,2 +1,4 @@
 [lfs]
 	url = https://gitlfs.koilishere.org/Koil/y3yp.git/info/lfs
+	pushurl = git@ssh-gitlfs.koilishere.org:Koil/y3yp.git
+	
